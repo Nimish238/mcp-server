@@ -1,37 +1,74 @@
 
 import hashlib
 import re
+from contextvars import ContextVar
 
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("Live Exam MCP Server")
 
 EMAIL = "26ds1000025@ds.study.iitm.ac.in"
+
+# Store headers separately for each active request
+request_headers = ContextVar("request_headers", default={})
+
+
+class HeaderMiddleware:
+    """Capture HTTP request headers for the current request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+
+        token = request_headers.set(headers)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            request_headers.reset(token)
+
+
+mcp = FastMCP(
+    "Live Exam MCP Server",
+    stateless_http=True,
+    json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "mcp-server-ln6h.onrender.com",
+            "mcp-server-ln6h.onrender.com:*",
+        ],
+    ),
+)
 
 
 @mcp.tool()
 async def solve_challenge(ctx: Context) -> str:
-    """Solve the exam challenge supplied in the HTTP request headers."""
+    """Return the required hash for the challenge in the HTTP headers."""
 
-    # Read headers from this individual MCP request
-    headers = ctx.headers or {}
+    headers = request_headers.get()
+    challenge = headers.get("x-exam-challenge", "")
 
-    challenge = headers.get("x-exam-challenge")
-
-    # Reject missing or incorrectly formatted challenges
-    if not challenge or not re.fullmatch(r"[0-9a-f]{32}", challenge):
+    if not re.fullmatch(r"[0-9a-f]{32}", challenge):
         raise ValueError("Missing or invalid X-Exam-Challenge header")
 
-    # Normalize the registered email
     normalized_email = EMAIL.strip().lower()
-
-    # Calculate SHA-256 of challenge:email
     message = f"{challenge}:{normalized_email}"
-    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
 
-    # Return only the first 16 lowercase hexadecimal characters
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
     return digest[:16]
 
 
-# Expose the MCP Streamable HTTP endpoint at /mcp
-app = mcp.streamable_http_app()
+# Create the MCP Streamable HTTP application
+mcp_app = mcp.streamable_http_app()
+
+# Wrap it to capture per-request HTTP headers
+app = HeaderMiddleware(mcp_app)
